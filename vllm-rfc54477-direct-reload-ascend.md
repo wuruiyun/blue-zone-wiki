@@ -82,31 +82,9 @@ flowchart LR
 | padding | `padding_fill_params` | 冷启动登记"哪些 MoE 参数是 padding"，begin 时整项清零（清零后必须全量重发有效区） |
 | 会话 | `_end_weight_update` / `reset_weight_update_target` | 结束会话、恢复默认更新目标，让下一轮能 start |
 
-Ascend 侧的唯一结构性差异在 begin 与派生刷新：begin 用 `checkpoint_views` 覆盖上游规划（为强制 NZ 参数提供 ND 加载区），派生刷新用 `refill_*` 系列保证地址不变。为什么必须这样，见 2.8、2.11 与 4.2.4。
+Ascend 侧的唯一结构性差异在 begin 与派生刷新：begin 用 `checkpoint_views` 覆盖上游规划（为强制 NZ 参数提供 ND 加载区），派生刷新用 `refill_*` 系列保证地址不变。为什么必须这样，见 2.6、2.7 与 4.2.4。
 
-### 2.2 会话边界与状态机
-
-RL 对外只有三段 API：`start_weight_update → update_weights × N → finish_weight_update`。传输渠道（HCCL / NPU IPC / M2N / 磁盘）与"转换"是两件事，渠道只负责把 checkpoint 格式的张量送到 loader 门口。
-
-```mermaid
-flowchart LR
-  S0["READY<br/>图已捕获 可推理"] -->|"start_weight_update"| S1["UPDATING<br/>模型处于 checkpoint 布局"]
-  S1 -->|"update_weights 分桶写入"| S1
-  S1 -->|"finish_weight_update"| S2["PWAL 重跑<br/>转回运行布局并写回"]
-  S2 -->|"成功"| S0
-  S1 -->|"load 失败"| S3["FAILED 半更新<br/>禁止推理"]
-  S2 -->|"后处理失败"| S3
-  S3 -->|"新 start + 完整重发"| S1
-  S3 -->|"不可恢复"| S4["重建进程或模型"]
-```
-
-读图要点：
-
-- **begin 到 finish 成功之间不能推理**。这期间模型里的字节是 checkpoint 格式，kernel 读它得到的是完全错误的数——不是"慢一点"，是"错"。
-- 失败进入 `FAILED` 后**没有回滚**：direct reload 不保存快照。唯一修复路径是"结束旧会话 → 新开一次完整更新 → 完整重发 → 成功 finish"。
-- **失败不能重试同一个 finish**：它可能已经把一部分模块处理过了，重试无法收敛。
-
-### 2.3 冷启动：在 PWAL 之前记录 checkpoint 布局
+### 2.2 冷启动：在 PWAL 之前记录 checkpoint 布局
 
 冷启动一共四步：加载、记录、后处理、捕获计算图。记录只在冷启动做一次，之后每一轮更新都复用它。
 
@@ -148,9 +126,9 @@ sequenceDiagram
 | `attrs`（loader 元数据） | 后处理可能改 `_output_dim/_packed_dim`，begin 要还原 | loader 用错的切分参数写入，静默错位 |
 | `storage` 指针 | 判断 storage 是否被搬过（被 `set_` 进融合 buffer） | offset 用错，#65281 修的就是这个 |
 
-### 2.4 一轮更新的全链路时序
+### 2.3 一轮更新的全链路时序
 
-这是主图，后面每节都是把其中一段放大。
+这是主图，后面几节分别把其中关键的一段放大。
 
 ```mermaid
 sequenceDiagram
@@ -191,7 +169,7 @@ sequenceDiagram
 - **finish 是"完整重跑"而不是"增量补几处"**：PWAL 本身非幂等（一次量化、一次融合、一次吸收），只有整段重跑才能保证结果等于冷启动。
 - **同步点在 finish 开头**：接收端可能在别的 stream 上写，不同步就开始后处理会读到半份数据。
 
-### 2.5 同一块 storage 的四种视角
+### 2.4 同一块 storage 的四种视角
 
 把镜头对准**一块 storage**：同一段显存，在不同阶段用的是不同的"解释方式"。
 
@@ -221,27 +199,7 @@ flowchart TD
 - **C1 写的是 checkpoint 布局的字节**：如果 B1 建错（本该恢复成转置布局，却直接用了运行布局），shape 全对、数值全错。
 - **最后一步（写回）必须落到 A3 那块 storage**，否则图读旧地址；**重算出来的派生值也必须写回图正在读的那个对象**。
 
-### 2.6 三条失效链与统一修法
-
-一次更新链路里任何一处做错，最终都会落到下面三条支路之一。
-
-```mermaid
-flowchart TD
-  A["图捕获 记住 kernel 读的地址 P0"] --> B{"更新链路哪里错了"}
-  B -->|"① 布局错"| B1["begin 没把张量变回 checkpoint 布局"]
-  B1 --> B1a["loader 把 checkpoint 字节写进运行布局<br/>转置/打包/NZ/padding 整体错位"]
-  B -->|"② 地址错"| B2["后处理每轮新建张量并重绑属性"]
-  B2 --> B2a["P0 被释放或复用<br/>不报错 但偶发乱码"]
-  B -->|"③ 派生值错"| B3["scale/倒数/MLA 派生/专家列表/融合 gate 没刷新"]
-  B3 --> B3a["weight 新了 输出还像旧权重"]
-  B1a --> C["统一修法：记录布局 → begin 视图 → 原 loader 写入 → 后处理写回原地址"]
-  B2a --> C
-  B3a --> C
-```
-
-**地址错这条最值得强调**：shape 对、dtype 对、程序不崩，只是数值不对，而且只在某些轮次某些 shape 触发。所以方案里所有"写回"都要求落到**旧 storage**，落不进去就报错，绝不静默换址。
-
-### 2.7 begin 的校验与视图恢复
+### 2.5 begin 的校验与视图恢复
 
 begin 是一次更新的入口：它要在改动模型之前，把所有可能失败的条件判完。
 
@@ -276,7 +234,7 @@ flowchart TD
 
 容量判定用了一个很小但关键的技巧：**用 stride 计算真实跨度**而不是 `numel`，这样"转置后的非连续布局"和"带空洞的 padded 视图"都能算对；再叠加 offset 修正（storage 被搬过时用当前 offset），就是 #65281 的内容。
 
-### 2.8 PWAL 的保址写回
+### 2.6 PWAL 的保址写回
 
 后处理天然想"算一个新张量、赋给属性"。direct 要求它写回旧地址，于是上游把常见模式收敛成五个工具：`replace_parameter`、`storage_view`、`refill_derived`、`retire_parameter`、`move_parameter`。核心就一条判定：**新张量能否塞进旧 storage**。
 
@@ -289,41 +247,7 @@ flowchart TD
 
 所以 **"保址"不是"从不换地址"，而是"从第一轮开始地址稳定"**：冷启动时换一次 storage 完全可以接受，因为图还没捕获。
 
-### 2.9 后处理的整段重跑与遍历顺序
-
-冷启动和更新结束都要跑后处理。旧实现里"跑哪些、按什么顺序、跑几次"是分散的：各模型自己写转发、各层签名不一致（有的要 `act_dtype`）。#57678 把它统一成一条遍历：
-
-| 顺序 | 谁 | 规则 |
-| --- | --- | --- |
-| 1 | 每个量化层（per-layer pass） | 先跑 quant method 自身的后处理 |
-| 2 | deferred attention 层 | attention pass |
-| 3 | 其余 module（children-first） | **子模块先于父模块**；共享子模块只跑一次，且先于所有父模块；根模块最后 |
-| 跳过 | quant method 实例、被 quant 拥有的子模块、deferred attention 层 | 前面已经处理过，再跑就是重复 |
-
-配套的签名变化：`process_weights_after_loading(self)` 无参化，attention 层在构造时把 `act_dtype` 存成 `self.act_dtype`，内部再传给 backend impl。原代码里"`act_dtype` 只为匹配签名而存在、本身未用"这类妥协也一并删掉。
-
-**同时必须删掉各模型自己写的转发**（VL wrapper 转发给 language_model、某些模型在 hook 里自己 `for module in self.modules()`）。否则"统一遍历 + wrapper 转发"= 双调：子模块跑两遍，第二遍对已经转换过的权重再转换一次。这是 Ascend 侧在阶段一 ④ 最容易踩的坑。
-
-### 2.10 finish 的一次性语义与失败会话
-
-`_direct_reload_begun` 在 finish 开头就被 `pop` 掉，所以**失败后重试同一个 finish 会直接报"finish without a begin"**。这是刻意的：失败时可能"前 6 个模块已经后处理、后 7 个还是 checkpoint 布局"，重试无法收敛。
-
-失败时还必须**结束旧会话**（清 active、重置更新目标），否则下一次 `start` 会被"已经有一个更新在进行中"挡住，会话就卡死到进程重启：
-
-```python
-# finish 失败：direct 已消费 begin，只能开新一轮完整更新
-try:
-    self.weight_transfer_engine.finish_weight_update()
-except BaseException:
-    if direct_reload_enabled():
-        self._end_weight_update()      # 清 active + reset 更新目标
-    raise
-self._end_weight_update()
-```
-
-**没有回滚**是设计选择，不是遗漏：direct reload 不保存快照，修复靠"下一次完整更新"。所以"失败后能重新 start"是硬需求。
-
-### 2.11 padding 与 meta 的初始化
+### 2.7 padding 与 meta 的初始化
 
 MoE 的专家权重常被 pad 到对齐尺寸。padding 不是 checkpoint 数据，loader 不会写它，但 kernel 会按整块读。冷启动时它是 0；更新后如果保留旧值或随机值，数值就可能错。三条规则：
 
@@ -332,18 +256,6 @@ MoE 的专家权重常被 pad 到对齐尺寸。padding 不是 checkpoint 数据
 3. **meta 物化要补 0**：`materialize_meta_tensor` 原本用 `empty_strided` 得到未初始化内存，padding 会留垃圾，改成 `empty_strided(...).zero_()`。
 
 这条对 Ascend 影响很大：Ascend 的 padding 发生在 **scheme 的后处理里**（`_maybe_pad_weight`、`F.pad`、TP padding），不在 `moe_config` 上，所以 Ascend 侧要自己实现等价的 selector（阶段一的 ③，见 4.2.4(7)）。
-
-### 2.12 上游要求与调用方责任
-
-这几条**不是已合入代码能自动保证的**，必须由调用方和测试承担：
-
-| 责任 | 具体要求 |
-| --- | --- |
-| 发送格式 | 按 checkpoint 名称发 checkpoint 格式；不能发推理端已经转置/NZ/融合后的格式 |
-| 发送完整性 | 一轮必须覆盖所有"PWAL 会改布局或非幂等"的模块；未发送的字节会被当成 checkpoint 再处理一次 |
-| 暂停推理 | begin 到 finish 成功之间不能推理；已合入代码没有覆盖所有服务入口的 pending 拒绝 |
-| 缓存有效性 | 更新影响 KV/prefix cache 时由调用方处理；不承诺"带历史请求的在线无缝切换" |
-| 失败处置 | 失败后停止服务，走"新开完整更新"；不可恢复则重建 |
 
 ---
 
@@ -504,7 +416,7 @@ sequenceDiagram
   G-->>C: 读到 B
 ```
 
-这张图与 2.4 的主图差别只有三处，正好是 Ascend 在阶段一的三个改造点：**begin 里多一层 Ascend 视图规划器**、**PWAL 里强制 NZ 要"临时 cast + 原地回填"**、**派生值要经过 Ascend 的 refill 工具**。
+这张图与 2.3 的主图差别只有三处，正好是 Ascend 在阶段一的三个改造点：**begin 里多一层 Ascend 视图规划器**、**PWAL 里强制 NZ 要"临时 cast + 原地回填"**、**派生值要经过 Ascend 的 refill 工具**。
 
 #### 4.2.3 拿到运行时对象，先问它是什么
 
@@ -651,7 +563,7 @@ def refill_runtime_parameter(layer, name, tensor):
 | --- | --- |
 | 直接在 NZ storage 上建 ND 视图给 loader 写 | NPU 的 `set_(storage)` 视图会**继承 storage 的 NZ 描述**，专家切片 loader 无法把它当 ND 用 |
 | 用 `npu_format_cast` 的返回值判断"是否已是 NZ" | 这套 CANN 上某些视图会"原地址返回 ND"，格式查询不可靠，只能以 `data_ptr` 为准 |
-| 每轮新建 NZ 张量再赋值 | 地址每轮漂移，图读旧地址（就是 2.6 的地址错） |
+| 每轮新建 NZ 张量再赋值 | 地址每轮漂移，图读到旧值，且不报错 |
 | NZ → NZ 也先 clone 再赋值 | 多余一次全量拷贝；`copy_` 在同布局 NZ→NZ 下既保址又保值 |
 
 代价要说清：**强制 NZ 的权重 2× 常驻**（NZ 运行区 + ND 加载区），每轮还有一次 clone 的瞬时峰值。方案接受这个代价，因为替代方案（每轮换地址）是正确性问题。
