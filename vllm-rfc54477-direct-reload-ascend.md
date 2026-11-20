@@ -16,7 +16,9 @@ RL 训练每一轮都会产出一份新权重 B。推理侧正在服务、**并�
 - **派生对象仍指向被丢弃的临时参数**，不报错，但输出用旧值或已释放内存；
 - **层与层之间的顺序靠 loader 上报**，半层权重被 finalize 就是静默的数值错位。
 
-RFC 最初（Rev 1）想用"给 PWAL 分类、更新时跳过一部分后处理"来省成本；Rev 2 放弃了这个方向——**跳过 PWAL 会让 MLA 这类派生数据继续读旧权重**。Rev 2 的结论是：
+把这三条翻成机制语言：**写错了位置（布局）**、**位置对但已经没人读（地址）**、**位置和值都对、但由它算出来的量没跟着变（派生值）**。第 2 章的三个参照系就是照着这三条建立的。
+
+RFC 最初（Rev 1）想用"给 PWAL（= `process_weights_after_loading`，加载后处理）分类、更新时跳过一部分后处理"来省成本；Rev 2 放弃了这个方向——**跳过 PWAL 会让 MLA 这类派生数据继续读旧权重**。Rev 2 的结论是：
 
 > 更新完成的模型必须等价于"用新 checkpoint 冷启动"，**同时**保留已捕获的图所引用的地址。
 
@@ -24,7 +26,7 @@ RFC 最初（Rev 1）想用"给 PWAL 分类、更新时跳过一部分后处理"
 
 ---
 
-## 2. RFC 的实现流程
+## 2. direct reload 的机制与设计依据
 
 ### 2.1 direct reload 总览
 
@@ -55,7 +57,6 @@ flowchart LR
 - 冷启动建立三个参照系：**布局**（`_ckpt` 记录）、**地址**（PWAL 之后的 storage）、**消费者**（捕获的图）。每轮只做两件事——换字节、按参照系重算。
 - `begin` 到 `finish` 成功之间**不能推理**：这期间模型里是 checkpoint 布局的字节，kernel 读它得到的是完全错误的数。
 - **失败不回滚**：finish 在开头就消费掉 begin，失败后只能开一轮完整更新，不能重试同一个 finish。
-- loader 只有一份：direct 不另写 loader，分片、TP 切片、tie、专家索引仍由 `model.load_weights` 负责——代价是调用方必须发全量 checkpoint 张量。
 
 使用者只看到三段 API（磁盘入口对应 `start_reload → load_weights → finish_reload`）：
 
@@ -69,7 +70,7 @@ flowchart LR
 
 | 时机 | 函数 | 干什么 |
 | --- | --- | --- |
-| 冷启动 | `record_checkpoint_layout` | 在 PWAL 之前给每个可加载张量记 `_ckpt`（shape/stride/dtype/offset + loader 属性 + storage 指针）与参数名集合；这是 begin 的参照系。别名按对象去重、按名字全记 |
+| 冷启动 | `record_checkpoint_layout` | 在 PWAL 之前给每个可加载张量记 `_ckpt`（shape/stride/dtype/offset + loader 属性 + storage 指针）与参数名集合；这是 begin 的参照系 |
 | 冷启动 | `process_weights_after_loading`（PWAL） | 一次完整的后处理：转置、打包、量化、融合、算派生 scale；运行布局与地址从此固定 |
 | 冷启动 | `finalize_model_weights` | 收尾遍历：children-first、无参 module hook、共享子模块去重 |
 | 每轮 start | `begin_direct_reload` | 把被改过布局的张量按 `_ckpt` 建回 checkpoint 视图、恢复 loader 属性、清零 padding；所有校验通过后才动模型 |
@@ -79,36 +80,14 @@ flowchart LR
 | 每轮 finish | `process_weights_after_loading` | 同一份 PWAL 再跑一遍：把 checkpoint 布局搬回运行布局，并重算派生量 |
 | 保参数身份 | `replace_parameter` / `retire_parameter` / `move_parameter` | 换形状时保住 `Parameter` 对象与 loader；退休不再被 kernel 读的源参数（下轮仍可加载）；让改名后的两个名字共享同一 storage |
 | 派生量刷新 | `refill_derived` / `refill_derived_buffer` / `refill_runtime_tensor` / `refill_nz_weight` / `refill_expert_list` | 把派生量写回**原来的地址**：普通属性、非持久 buffer、运行张量（含物理 NZ）、专家列表；布局或物理 format 变了就报错，绝不静默换址 |
-| padding | `padding_fill_params` | 冷启动登记"哪些 MoE 参数是 padding"，begin 时整项清零（清零后必须全量重发有效区） |
+| padding | `padding_fill_params` | 冷启动登记"哪些 MoE 参数是 padding"，begin 时整项清零（清零后必须全量重发有效区）；上游已换成 `fill_on_reload`，见 2.6 |
 | 会话 | `_end_weight_update` / `reset_weight_update_target` | 结束会话、恢复默认更新目标，让下一轮能 start |
 
-Ascend 侧的唯一结构性差异在 begin 与派生刷新：begin 用 `checkpoint_views` 覆盖上游规划（为强制 NZ 参数提供 ND 加载区），派生刷新用 `refill_*` 系列保证地址不变。为什么必须这样，见 2.6、2.7 与 4.2.5。
+Ascend 侧的唯一结构性差异在 begin 与派生刷新：begin 用 `checkpoint_views` 覆盖上游规划（为强制 NZ 参数提供 ND 加载区），派生刷新用 `refill_*` 系列保证地址不变。为什么必须这样，见 2.5、2.6、2.7 与 4.2.5。
 
 ### 2.2 冷启动：在 PWAL 之前记录 checkpoint 布局
 
 冷启动一共四步：加载、记录、后处理、捕获计算图。记录只在冷启动做一次，之后每一轮更新都复用它。
-
-```mermaid
-sequenceDiagram
-  autonumber
-  participant W as Worker
-  participant L as 模型 loader
-  participant R as direct 记录
-  participant P as PWAL
-  participant G as 图捕获
-
-  W->>L: load_weights 冷加载 A
-  L-->>W: 参数与 storage 就位 仍是 checkpoint 布局
-  W->>R: record_checkpoint_layout model
-  R->>R: 每个可加载张量写 _ckpt 四元组
-  R->>R: 记录 checkpoint 参数名集合 含别名
-  R->>R: 记录 padding 清零清单
-  W->>P: process_weights_after_loading
-  P->>P: 转置 打包 量化 融合 算派生 scale
-  P-->>W: 运行布局就位 地址从此固定
-  W->>G: capture 首次前向
-  G-->>W: 图记住 kernel 实际读取的地址
-```
 
 四条决定设计形状的要点：
 
@@ -164,7 +143,7 @@ sequenceDiagram
 
 读图要点：
 
-- **begin 之前全部校验完**：一旦 begin 返回，模型就进入"不能推理"状态，所以任何可能失败的检查（参数被换过、storage 装不下、共享参数布局变了）必须在此之前做完。
+- **begin 之前全部校验完**：一旦 begin 返回，模型就进入"不能推理"状态，所以可能失败的检查（参数被换过、storage 装不下、共享参数布局变了）必须提前做完（见 2.5）。
 - **load 用的是模型自己的 loader**，没有"direct 专用 loader"。分片、TP 切片、tie、专家索引、dtype 转换一份都不重写——这保证更新路径与冷启动路径是同一份代码。代价是调用方**必须把每个模块的完整 checkpoint 张量发全**。
 - **finish 是"完整重跑"而不是"增量补几处"**：PWAL 本身非幂等（一次量化、一次融合、一次吸收），只有整段重跑才能保证结果等于冷启动。
 - **同步点在 finish 开头**：接收端可能在别的 stream 上写，不同步就开始后处理会读到半份数据。
@@ -197,7 +176,7 @@ flowchart TD
 - **A2 → A3 是"格式变换"**：可能改 shape/stride、改字节数（padding）、甚至换 storage（变大装不下）。这一步由 PWAL 完成。
 - **A3 → B1 是"零成本重解释"**：只新建视图让 loader 有位可写，数据没动，所以此刻图读到的值是错的——这就是"不能推理"的原因。
 - **C1 写的是 checkpoint 布局的字节**：如果 B1 建错（本该恢复成转置布局，却直接用了运行布局），shape 全对、数值全错。
-- **最后一步（写回）必须落到 A3 那块 storage**，否则图读旧地址；**重算出来的派生值也必须写回图正在读的那个对象**。
+- **写回必须落回 A3 那块 storage**，派生值也必须写回图正在读的那个对象——这正是 2.7 要解决的保址问题。
 
 ### 2.5 begin 的校验与视图恢复
 
@@ -232,9 +211,21 @@ flowchart TD
 | 共享张量被改布局 | draft 复用了 target 的参数，而 draft 的更新不重发它 | 让共享方各自拥有，或在 target 侧更新 |
 | 容量不足 | PWAL 把张量缩小了（打包/pad 后字节数变小） | 用独立加载区（Ascend 的 ND staging 就是这种） |
 
-容量判定用了一个很小但关键的技巧：**用 stride 计算真实跨度**而不是 `numel`，这样"转置后的非连续布局"和"带空洞的 padded 视图"都能算对；再叠加 offset 修正（storage 被搬过时用当前 offset），就是 #65281 的内容。
+容量怎么算（**用 stride 算真实跨度**而不是 `numel`，这样非连续布局和带空洞的 padded 视图都能算对）、storage 被搬过时怎么改 offset（#65281），都在 2.7(2) 的 `_in_own_storage` 里展开。
 
-### 2.6 PWAL 的保址写回
+### 2.6 padding 与 meta 的初始化
+
+MoE 的专家权重常被 pad 到对齐尺寸。padding 不是 checkpoint 数据，loader 不会写它，但 kernel 会按整块读。冷启动时它是 0；更新后如果保留旧值或随机值，数值就可能错。三条规则：
+
+1. **selector 的判定**：只有"维度对不上"（hidden/intermediate 大于 unpadded 版本，或 TP shard 带 padding）时才需要清；**per-expert 标量（`(E,)`、`(E, ≤2)`）不是 padding 的对象**，混进去会把真实数据清零。
+2. **清零会擦掉 checkpoint 区域**，所以清零之后调用方**必须完整重发这些参数的有效区**——"begin 清零"与"必须全量发送"是绑定的。
+3. **meta 物化要补 0**：`materialize_meta_tensor` 原本用 `empty_strided` 得到未初始化内存，padding 会留垃圾，改成 `empty_strided(...).zero_()`。
+
+这条对 Ascend 影响很大：Ascend 的 padding 发生在 **scheme 的后处理里**（`_maybe_pad_weight`、`F.pad`、TP padding），不在 `moe_config` 上，所以 Ascend 侧要自己实现等价的 selector（阶段一的 ③，见 4.2.5(7)）。
+
+注：上游 #67563 已把这个机制换成 Parameter 上的 `fill_on_reload`（见 3.2），本节按阶段一实际代码（`_ckpt_padding_fill`）描述，迁移动作见 4.6.2。
+
+### 2.7 PWAL 的保址写回
 
 PWAL 天然想"算一个新张量、赋给属性"。direct 要求它写回**旧地址**，于是上游把常见写法收敛成五个工具，判定只有一条：**新张量能不能塞进参数自己那块 storage**。
 
@@ -357,21 +348,11 @@ def refill_runtime_tensor(layer, name, tensor):
 
 **"保址"不是"从不换地址"，而是"从第一轮开始地址稳定"**：冷启动时换一次 storage 完全可以接受，因为图还没捕获；更新期间一旦换了，图就永远读旧地址。
 
-### 2.7 padding 与 meta 的初始化
-
-MoE 的专家权重常被 pad 到对齐尺寸。padding 不是 checkpoint 数据，loader 不会写它，但 kernel 会按整块读。冷启动时它是 0；更新后如果保留旧值或随机值，数值就可能错。三条规则：
-
-1. **selector 的判定**：只有"维度对不上"（hidden/intermediate 大于 unpadded 版本，或 TP shard 带 padding）时才需要清；**per-expert 标量（`(E,)`、`(E, ≤2)`）不是 padding 的对象**，混进去会把真实数据清零。
-2. **清零会擦掉 checkpoint 区域**，所以清零之后调用方**必须完整重发这些参数的有效区**——"begin 清零"与"必须全量发送"是绑定的。
-3. **meta 物化要补 0**：`materialize_meta_tensor` 原本用 `empty_strided` 得到未初始化内存，padding 会留垃圾，改成 `empty_strided(...).zero_()`。
-
-这条对 Ascend 影响很大：Ascend 的 padding 发生在 **scheme 的后处理里**（`_maybe_pad_weight`、`F.pad`、TP padding），不在 `moe_config` 上，所以 Ascend 侧要自己实现等价的 selector（阶段一的 ③，见 4.2.5(7)）。
-
 ---
 
 ## 3. 上游来源：从 12 项到 27 项
 
-方案四**不按上游 PR 分组交付**，只把 PR 当作"机制来源"。下面三张表依次是：基线 12 项、11-09 之后新合入的关键项、以及未合入项划出的边界。
+方案四**不按上游 PR 分组交付**，只把 PR 当作"机制来源"。下面三张表依次是：基线 12 项、11-09 之后新合入的关键项、以及未合入项划出的边界。五个阶段的定义见 4.1，本章只登记来源与落点。
 
 ### 3.1 基线 12 项（2026-11-09 快照）
 
@@ -424,13 +405,7 @@ MoE 的专家权重常被 pad 到对齐尺寸。padding 不是 checkpoint 数据
 
 **已经合入、不再作为边界的前项**：#65799（完整性检查）、#65487 / #65353（packed 对齐、gated MXFP4）、#65562 之外的 KV scale 项——它们的语义已进 3.2，按新语义实现即可。
 
-### 3.4 为什么"来源"与"交付单元"要分开
-
-1. 同一项机制跨阶段使用：#64692 在阶段一用于 BF16 持久运行缓冲与融合投影，到阶段四才扩展到量化 scale；
-2. 一个阶段要用多项机制：阶段一同时依赖上表中的 6 项；
-3. 阶段是否完成，由"目标场景的端到端证据"判定，而不是"某个 PR 的每一处都改过了"。
-
-也正因如此，旧方案三里的 **G1 / G2 / G3 / G4 只是历史交付名称**。它们按来源分组，与方案四的阶段不是一一对应关系。
+**为什么"来源"要单独登记**：同一项机制会跨阶段使用（#64692 在阶段一用于 BF16 运行缓冲，到阶段四才扩展到量化 scale），一个阶段也要多项机制（阶段一同时依赖 6 项）。所以阶段是否完成，看的是目标场景的端到端证据，而不是"某个 PR 的每一处都改过了"。旧方案三的 G1～G4 只是历史交付名称，与方案四的阶段不是一一对应关系。
 
 ---
 
@@ -1139,35 +1114,7 @@ for target, source in zip(old, tensors):
 
 ### 5.2 上游 PR 索引
 
-| PR | 主题 | 方案四中的位置 |
-| --- | --- | --- |
-| [#62407](https://github.com/vllm-project/vllm/pull/62407) | 参数身份、别名、loader 语义 | 阶段一 ① |
-| [#64336](https://github.com/vllm-project/vllm/pull/64336) | direct 生命周期、checkpoint 视图、worker 会话 | 阶段一 ②⑥ |
-| [#64692](https://github.com/vllm-project/vllm/pull/64692) | 派生 tensor/scale/constants 原位刷新 | 阶段一 ⑤（阶段四扩展到 scale） |
-| [#65281](https://github.com/vllm-project/vllm/pull/65281) | 搬移后的当前 offset | 阶段一 ② |
-| [#57678](https://github.com/vllm-project/vllm/pull/57678) | 无参 hook、children-first 遍历 | 阶段一 ④ |
-| [#64357](https://github.com/vllm-project/vllm/pull/64357) | 模型级 hook 移到加载末尾 | 阶段一 ④ |
-| [#65914](https://github.com/vllm-project/vllm/pull/65914) | 所有路径统一 finish | 阶段一 ④（阶段二核对其他入口） |
-| [#64886](https://github.com/vllm-project/vllm/pull/64886) | 被 #65914 替代 | 仅记录替代关系 |
-| [#64352](https://github.com/vllm-project/vllm/pull/64352) | begin 清零 padded MoE 参数 | 阶段一 ③（被 #67563 替换，见阶段五） |
-| [#64691](https://github.com/vllm-project/vllm/pull/64691) | 更新后同步与缓存清理 | 阶段一交付边界 / 阶段三资源表现 |
-| [#66010](https://github.com/vllm-project/vllm/pull/66010) | level-2 sleep 只丢纯参数分配 | 阶段三 |
-| [#65296](https://github.com/vllm-project/vllm/pull/65296) | ROCm preshuffle scale 身份 | ROCm 留档，无 NPU 任务 |
-
-11-09 之后新合入、且落在 Ascend 改过路径上的项：
-
-| PR | 主题 | 方案四中的位置 |
-| --- | --- | --- |
-| [#65347](https://github.com/vllm-project/vllm/pull/65347) | A→B→A 逐 tensor 位级一致的 refit 测试（含地址/内存/sleep 变体） | 阶段三（sleep 包裹）+ 4.7 验收口径 |
-| [#65799](https://github.com/vllm-project/vllm/pull/65799) | finish 完整性检查（缺 parameter 即拒绝） | 阶段五（4.6.2） |
-| [#67563](https://github.com/vllm-project/vllm/pull/67563) | padding 改为 Parameter 上的 `fill_on_reload` | 阶段五（4.6.2） |
-| [#68345](https://github.com/vllm-project/vllm/pull/68345) | finish 只重跑冷启动记录的 `_ckpt_modules` | 阶段五（4.6.2） |
-| [#68043](https://github.com/vllm-project/vllm/pull/68043) | packed 传输线格式统一（`chunk_layout`） | 阶段二 packed 格 + 阶段五（4.6.2） |
-| [#68041](https://github.com/vllm-project/vllm/pull/68041) | direct 变默认 + 拒绝集中到 `start_reload`（**未合入**） | 阶段五（4.6.3） |
-| [#66487](https://github.com/vllm-project/vllm/pull/66487) | direct finish 不再重新 tie word embeddings | 阶段五（顺手项） |
-| [#66118](https://github.com/vllm-project/vllm/pull/66118) | indexer `wk` / `weights_proj` 独立成层加载 | 阶段二模型线（GLM） |
-| [#65802](https://github.com/vllm-project/vllm/pull/65802) | online 量化的 direct reload | 不在本次范围 |
-| [#68329](https://github.com/vllm-project/vllm/pull/68329) | 删除 torchao reload decorator | 阶段五（顺手项） |
+上游 PR 的完整清单、合入时间与 Ascend 落点见第 3 章（3.1 基线 12 项、3.2 新合入的关键项、3.3 未合入与边界），此处不重复。
 
 设计来源：[vllm-project/vllm#54477](https://github.com/vllm-project/vllm/issues/54477)。
 
@@ -1182,5 +1129,5 @@ for target, source in zip(old, tensors):
 | meta 物化 | `vllm/model_executor/model_loader/reload/meta.py` |
 | padding selector | `vllm/model_executor/layers/fused_moe/routed_experts.py::padding_fill_params` |
 | Ascend 工具与 NZ | `vllm_ascend/model_loader/weight_reload.py` |
-| Ascend 接入 patch | `vllm_ascend/patch/worker/patch_direct_reload.py`、`patch/worker/__init__.py` |
+| Ascend 接入 patch | `vllm_ascend/patch/worker/__init__.py`（收缩版在 import 期直接安装；上一版是独立文件 `patch/worker/patch_direct_reload.py`） |
 | Ascend 会话状态机 | `vllm_ascend/worker/worker.py` |
