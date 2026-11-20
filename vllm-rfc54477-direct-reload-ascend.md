@@ -1112,9 +1112,45 @@ for target, source in zip(old, tensors):
 | retired 参数 | 标记退休的源参数：保留注册与数据、可再加载、被 kernel 参数枚举跳过 |
 | NZ / ND | Ascend 的 FRACTAL_NZ 物理排布 / 普通 ND 排布 |
 
-### 5.2 上游 PR 索引
+### 5.2 上游 PR 索引（含合入时间）
 
-上游 PR 的完整清单、合入时间与 Ascend 落点见第 3 章（3.1 基线 12 项、3.2 新合入的关键项、3.3 未合入与边界），此处不重复。
+合入时间取 GitHub API 的 `merged_at`（UTC，只保留日期），表内按时间排序。表一为 2026-11-09 基线快照内已合入的 12 项，表二为之后新合入、且与方案相关的 12 项。
+
+**基线 12 项（≤ 2026-11-06）**
+
+| PR | 主题 | 合入时间（UTC） | 方案四中的位置 |
+| --- | --- | --- | --- |
+| [#62407](https://github.com/vllm-project/vllm/pull/62407) | 参数身份、别名、loader 语义 | 2026-10-28 | 阶段一 ① |
+| [#64357](https://github.com/vllm-project/vllm/pull/64357) | 模型级 hook 移到加载末尾 | 2026-10-30 | 阶段一 ④ |
+| [#64691](https://github.com/vllm-project/vllm/pull/64691) | 更新后同步与缓存清理 | 2026-10-30 | 阶段一交付边界 / 阶段三资源表现 |
+| [#64336](https://github.com/vllm-project/vllm/pull/64336) | direct 生命周期、checkpoint 视图、worker 会话 | 2026-10-31 | 阶段一 ②⑥ |
+| [#57678](https://github.com/vllm-project/vllm/pull/57678) | 无参 hook、children-first 遍历 | 2026-11-02 | 阶段一 ④ |
+| [#64692](https://github.com/vllm-project/vllm/pull/64692) | 派生 tensor/scale/constants 原位刷新 | 2026-11-02 | 阶段一 ⑤（阶段四扩展到 scale） |
+| [#65281](https://github.com/vllm-project/vllm/pull/65281) | 搬移后的当前 offset | 2026-11-03 | 阶段一 ② |
+| [#65296](https://github.com/vllm-project/vllm/pull/65296) | ROCm preshuffle scale 身份 | 2026-11-03 | ROCm 留档，无 NPU 任务 |
+| [#64886](https://github.com/vllm-project/vllm/pull/64886) | 被 #65914 替代 | 2026-11-05 | 仅记录替代关系 |
+| [#65914](https://github.com/vllm-project/vllm/pull/65914) | 所有路径统一 finish | 2026-11-06 | 阶段一 ④（阶段二核对其他入口） |
+| [#64352](https://github.com/vllm-project/vllm/pull/64352) | begin 清零 padded MoE 参数 | 2026-11-06 | 阶段一 ③（已被 #67563 替换） |
+| [#66010](https://github.com/vllm-project/vllm/pull/66010) | level-2 sleep 只丢纯参数分配 | 2026-11-06 | 阶段三 |
+
+**11-09 之后新合入（与方案相关）**
+
+| PR | 主题 | 合入时间（UTC） | 方案四中的位置 |
+| --- | --- | --- | --- |
+| [#65347](https://github.com/vllm-project/vllm/pull/65347) | A→B→A 与冷启动逐 tensor 位级一致的 refit 测试 | 2026-11-16 | 阶段三（sleep 包裹）+ 4.7 验收口径 |
+| [#65802](https://github.com/vllm-project/vllm/pull/65802) | online 量化的 direct reload | 2026-11-16 | 不在本次范围 |
+| [#65799](https://github.com/vllm-project/vllm/pull/65799) | finish 完整性检查（缺 parameter 即拒绝） | 2026-11-18 | 阶段五（4.6.2） |
+| [#66487](https://github.com/vllm-project/vllm/pull/66487) | direct finish 不再重新 tie word embeddings | 2026-11-18 | 阶段五（顺手项） |
+| [#67563](https://github.com/vllm-project/vllm/pull/67563) | padding 改为 Parameter 上的 `fill_on_reload` | 2026-11-18 | 阶段五（4.6.2） |
+| [#68345](https://github.com/vllm-project/vllm/pull/68345) | finish 只重跑冷启动记录的 `_ckpt_modules` | 2026-11-18 | 阶段五（4.6.2） |
+| [#65353](https://github.com/vllm-project/vllm/pull/65353) | gpt-oss streamed MXFP4 专家按 TP 整块切分 | 2026-11-18 | 参考（与 Ascend 专家切分同构） |
+| [#67836](https://github.com/vllm-project/vllm/pull/67836) | load plan：跨 dtype 拷贝记为 direct 写 | 2026-11-19 | 若接入 `use_load_plan` 则为新基线 |
+| [#68043](https://github.com/vllm-project/vllm/pull/68043) | packed 传输线格式统一（`chunk_layout`） | 2026-11-19 | 阶段二 packed 格 + 阶段五（4.6.2） |
+| [#68329](https://github.com/vllm-project/vllm/pull/68329) | 删除 torchao reload decorator | 2026-11-19 | 阶段五（顺手项） |
+| [#65487](https://github.com/vllm-project/vllm/pull/65487) | packed entry 对齐（部分被 #68043 重做） | 未取到 | 阶段二 packed 格 |
+| [#66118](https://github.com/vllm-project/vllm/pull/66118) | indexer `wk` / `weights_proj` 独立成层加载 | 未取到 | 阶段二模型线（GLM） |
+
+`#65487` 与 `#66118` 的精确合入时间未从 API 取到，仅由 tracker 确认已合入。未合入项（#68041 / #68094 / #66666 / #66002 / #65562 / #68032）见 3.3。
 
 设计来源：[vllm-project/vllm#54477](https://github.com/vllm-project/vllm/issues/54477)。
 
