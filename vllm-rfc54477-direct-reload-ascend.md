@@ -79,11 +79,11 @@ flowchart LR
 | 每轮 finish | `finish_direct_reload` | 消费 begin（一次性）、设备同步、清 quant method 的一次性 guard，然后整段重跑 PWAL |
 | 每轮 finish | `process_weights_after_loading` | 同一份 PWAL 再跑一遍：把 checkpoint 布局搬回运行布局，并重算派生量 |
 | 保参数身份 | `replace_parameter` / `retire_parameter` / `move_parameter` | 换形状时保住 `Parameter` 对象与 loader；退休不再被 kernel 读的源参数（下轮仍可加载）；让改名后的两个名字共享同一 storage |
-| 派生量刷新 | `refill_derived` / `refill_derived_buffer` / `refill_runtime_tensor` / `refill_nz_weight` / `refill_expert_list` | 把派生量写回**原来的地址**：普通属性、非持久 buffer、运行张量（含物理 NZ）、专家列表；布局或物理 format 变了就报错，绝不静默换址 |
+| 派生量刷新 | `refill_derived`（含参数上的运行区）/ `refill_derived_buffer` / `refill_nz_weight` / `refill_expert_list` | 把派生量写回**原来的地址**：参数上的运行区、非持久 buffer、物理 NZ 权重、专家列表；布局或物理 format 变了就报错，绝不静默换址 |
 | padding | `padding_fill_params` | 冷启动登记"哪些 MoE 参数是 padding"，begin 时整项清零（清零后必须全量重发有效区）；上游已换成 `fill_on_reload`，见 2.6 |
 | 会话 | `_end_weight_update` / `reset_weight_update_target` | 结束会话、恢复默认更新目标，让下一轮能 start |
 
-Ascend 侧的唯一结构性差异在 begin 与派生刷新：begin 用 `checkpoint_views` 覆盖上游规划（为强制 NZ 参数提供 ND 加载区），派生刷新用 `refill_*` 系列保证地址不变。为什么必须这样，见 2.5、2.6、2.7 与 4.2.5。
+Ascend 侧的唯一结构性差异在 begin 与派生刷新：begin 用 `checkpoint_views` 覆盖上游规划（为强制 NZ 参数提供 ND 加载区），派生刷新用 `refill_*` 系列保证地址不变。为什么必须这样，见 2.5、2.6、2.7 与 4.2.4～4.2.5。
 
 ### 2.2 冷启动：在 PWAL 之前记录 checkpoint 布局
 
@@ -221,7 +221,7 @@ MoE 的专家权重常被 pad 到对齐尺寸。padding 不是 checkpoint 数据
 2. **清零会擦掉 checkpoint 区域**，所以清零之后调用方**必须完整重发这些参数的有效区**——"begin 清零"与"必须全量发送"是绑定的。
 3. **meta 物化要补 0**：`materialize_meta_tensor` 原本用 `empty_strided` 得到未初始化内存，padding 会留垃圾，改成 `empty_strided(...).zero_()`。
 
-这条对 Ascend 影响很大：Ascend 的 padding 发生在 **scheme 的后处理里**（`_maybe_pad_weight`、`F.pad`、TP padding），不在 `moe_config` 上，所以 Ascend 侧要自己实现等价的 selector（阶段一的 ③，见 4.2.5(7)）。
+这条对 Ascend 影响很大：Ascend 的 padding 发生在 **scheme 的后处理里**（`_maybe_pad_weight`、`F.pad`、TP padding），不在 `moe_config` 上，所以 Ascend 侧要自己实现等价的 selector。阶段一直接继承上游的清零流程（见 4.2.1）；机制换版后的迁移见 4.6.2。
 
 注：上游 #67563 已把这个机制换成 Parameter 上的 `fill_on_reload`（见 3.2），本节按阶段一实际代码（`_ckpt_padding_fill`）描述，迁移动作见 4.6.2。
 
@@ -321,28 +321,14 @@ def refill_runtime_parameter(layer, name, tensor):
     ckpt = getattr(parameter, "_ckpt", None)
     if ckpt is not None and not hasattr(parameter, "_direct_reload_staging"):
         shape, stride, dtype, offset = ckpt[1]
-        parameter._direct_reload_staging = ...      # 按 checkpoint 布局另开 ND 区
-    parameter.data = refill_runtime_tensor(layer, name, tensor)   # 运行区原位 copy_
+        parameter._direct_reload_staging = ...        # 按 checkpoint 布局另开 ND 区
+    # 运行区挂在 Parameter 自己身上：它在 begin/finish 期间一直存活
+    parameter.data = refill_derived(parameter, "_direct_reload_runtime", tensor)
 ```
 
-- **运行张量挂在非 Module 对象上**（MLAPO 的三个 NZ 投影、KPool 的派生 buffer）：没有 `Parameter` 可保，就用 `_reload_runtime_buffers[name]` 记住第一次的分配，之后每轮 `copy_` 并返回旧对象：
+这里用的是**上游的 `refill_derived`**，把运行区挂在 `Parameter` 自己身上，而不是维护一张按属性名索引的字典：属性名会被 PWAL 反复重绑，`Parameter` 对象不会——挂错地方，下一轮就找不到那块运行区了。
 
-```python
-def refill_runtime_tensor(layer, name, tensor):
-    buffers = layer.__dict__.setdefault("_reload_runtime_buffers", {})
-    old = buffers.get(name)
-    if old is None:
-        buffers[name] = tensor
-        return tensor
-    if _layout(old) != _layout(tensor):
-        raise ValueError(f"{name}: runtime layout changed; rebuild and recapture graphs")
-    if old.device.type == "npu" and torch_npu.get_npu_format(old) != torch_npu.get_npu_format(tensor):
-        raise ValueError(f"{name}: physical format changed; rebuild and recapture graphs")
-    old.copy_(tensor)
-    return old
-```
-
-与上游的差别只有一条：上游"塞不下就换 `.data`"，Ascend 侧"布局或物理 format 变了就报错"。为什么必须这样，见 4.2.5(3)。
+与上游的差别只有一条：上游"塞不下就换 `.data`"，Ascend 侧"布局或物理 format 变了就报错"。为什么必须这样，见 4.2.4（档 2 的断点 ②）。
 
 **(5) 所以"保址"的准确含义**
 
@@ -473,65 +459,177 @@ flowchart LR
 
 **阶段依赖与并行关系**：
 
-1. 先固定配套基线（vLLM `c410543d9`、vllm-ascend `4d90fc908`），核对哪些已合入项在目标 pin 内；
+1. 先固定配套基线：Ascend 分支 `feat/rfc54477-qwen-only`（基于 `31bb5f5f0`）、vLLM verified `c410543d9`，核对哪些已合入项在目标 pin 内；
 2. **阶段一**：冷加载与源保留 → begin 与视图恢复 → 分桶写入与 MoE padding → finish 与 hook 所有权 → 图可见权重写回 → worker 会话与恢复。这六步就是调用顺序，不能跳步验收；
 3. **阶段二**：可**立即开始、与阶段三/四并行**——每格独立验收，互不阻塞；只有 packed 与阶段五的线格式迁移有耦合；
 4. **阶段三**：Level-2 依赖阶段一的 begin/finish 与 worker 会话 → 真实权重传输依赖 worker 与 allocator 接口；
 5. **阶段四**：量化 scale 是阶段一 ⑤ 在量化场景的扩展，必须先有同格式冷加载参考；
 6. **阶段五**：跟随上游 pin 更新节奏，按"静默错优先"的顺序逐项迁移。
 
-**实际执行到哪**：阶段一已有收缩版 PR（11 文件 / 5 个生产文件），28 单测 + 2 子测试通过、12 项整模型热重载（0.6B / 30B × eager / graph × 磁盘 / HCCL，含 NZ）逐轮断言通过、仓内 e2e unpacked direct 629 s、layerwise 418 s 通过（packed 仍 skip）；阶段二~五未开始。
+**实际执行到哪**：阶段一已有收缩版 PR（13 文件 / 5 个生产文件，基于 Ascend `31bb5f5f0`），28 个单测通过。190 A3 上用 Qwen3-0.6B 与 Qwen3-30B-A3B（普通 + MegaMoE）跑通 **10 项全层热重载**：`FULL_DECODE_ONLY` 与 eager × 磁盘 / 非 packed HCCL，A→B→A 每轮 token 与 top-5 logprob 对齐各自独立冷载，图实例不变、回放增长、新增捕获为 0；MegaMoE 另核对 expert-list 地址与真实 `_apply_cann_mega_moe` 调用计数（96/192/288）。阶段二~五未开始。
 
-### 4.2 阶段一：收缩版 PR（BF16 Qwen 基础实现）
+### 4.2 阶段一：场景 × 断点（BF16 Qwen）
 
 **输入**：已冷加载并捕获 decode 图的 target 模型 A（未量化 BF16），以及同结构 checkpoint B；显式 `VLLM_RELOAD_MODE=direct`、`weight_nz_mode=0`、非量化 KV、关闭推测解码。
 **输出**：在同一引擎、同一图实例中可以推理的 B（0 recapture、逐 token / 逐 top-5 logprob 等于独立冷载 B），以及下一轮还能装回 A 的模型。
-**范围说明**：算子内部强制使用的物理 NZ（FRACTAL_NZ）**属于本阶段**——它是物理排布，不是量化。
+**范围**：算子内部强制使用的物理 NZ（FRACTAL_NZ）**属于本阶段**——它是物理排布，不是量化。
 
-#### 4.2.1 收缩版交付了什么
+阶段一的核心判断不是"要补哪些代码"，而是"**哪些场景上游原样就能跑，哪些场景的物理形态让上游契约不成立**"。
 
-这个 PR **没有**新增"重载"功能本身——`begin → loader 写入 → finish → PWAL` 的生命周期全在上游。它做的是把上游的通用契约，接到 Ascend 的三种特殊物理形态上，再补齐入口、测试与证据。三个真正难的运行期问题：
+#### 4.2.1 继承：上游已经提供了什么
 
-1. **上游让 loader"在参数自己的 storage 上铺一个 ND 视图"往回写，而 Ascend 的 storage 里是 NZ**。NZ storage 不是 ND 字节，在上面铺 ND 视图写下去就是垃圾；NPU 的 `set_(storage)` 又会继承 storage 的 NZ 描述符，所以连"借一块 NZ storage 当 ND 用"都不行 → 必须另分配一块纯 ND staging 作为 loader 目的地。
-2. **PWAL 每轮都会新分配张量并改写属性，而图读的是第一轮地址**。每轮都再做一次 NZ cast、再 `unbind + clone` 一份专家列表、再 `transpose + contiguous`，然后把属性指过去 → direct 下必须"保留第一次的运行分配，之后只 `copy_` 值进去，并把属性指回那块分配"。
-3. **老代码 `del layer.w13_weight` 删掉源参数，而上游 `begin` 会拒绝"checkpoint 名字下的对象被换/被删"** → direct 下改成 `retire_parameter`：对象与数据都保留、kernel 侧跳过。
+阶段一**没有新增任何协议**。它只在"物理形态"这一层加东西，其余全部原样继承：
 
-生产文件只有 5 个：
-
-| # | 文件 | +/− | 一句话作用 |
-| --- | --- | --- | --- |
-| 1 | `model_loader/weight_reload.py`（新增 154 行） | +154 | 保留运行分配、ND staging、expert-list 回填、替换上游 `_checkpoint_views` |
-| 2 | `ops/fused_moe/routed_experts.py` | +16/−12 | MoE PWAL 里 4 处 cast/split 改成 `refill_nz_weight` / `refill_expert_list` + `retire_parameter` |
-| 3 | `patch/worker/__init__.py` | +7 | direct 模式下在 import 期安装视图补丁 |
-| 4 | `patch/__init__.py` | +8 | 补丁登记：补了哪个上游符号、为什么、何时删 |
-| 5 | `worker/worker.py` | +28/−11 | 给 start/update/finish/reload 套 `set_current_vllm_config`，统一会话收尾 |
-
-另有 6 个测试文件（1 新增 5 修改），其中 `tests/ut/model_loader/test_weight_reload.py` 新增 169 行。
-
-**收缩掉的部分**（相对上一轮 17 文件版，整条注意力线被删，接回工作属于阶段二）：
-
-| 上一版有 | 本版 | 后果 |
+| 上游组件 | 它负责什么 | 阶段一动它吗 |
 | --- | --- | --- |
-| `attention/sfa_v1.py`（源参数保留 + PROLOG_V3 回填） | 无 | SFA / DeepSeek 的 `W_UK` / `W_UV` / `weight_dq` 等不再适配 |
-| `attention/indexer_kpool.py`（5 个派生 buffer） | 无 | KPool / indexer 派生状态不再适配 |
-| `ops/mla.py`（`IndexerWrapper` hook 所有权） | 无 | 无 |
-| `ops/linear.py`（`wo_a` 三维 reshape 走 `replace_parameter`） | 无 | 纯 dense BF16 走上游路径即可 |
-| `patch/worker/patch_direct_reload.py`（独立文件） | 并入 `patch/worker/__init__.py` | 少一个文件，行为等价 |
-| `weight_reload.py` 177 行（含 `refill_derived_buffer`） | 154 行 | KPool 用到的那部分一起删掉 |
+| `begin_direct_reload` | `_check_params_kept`、归属/容量校验、`t.data = view`、恢复 loader 属性、padding 清零 | **不改**（只替换它内部调用的 `_checkpoint_views`） |
+| `finish_direct_reload` | 一次性标记、设备同步、清 quant method guard、整段重跑 PWAL | 不改 |
+| `process_weights_after_loading` / `finalize_model_weights` | 逐层 quant pass + children-first 无参 hook | 不改 |
+| `model.load_weights` | 分片、TP 切片、tie、专家索引、dtype 转换 | **不改**——这就是"direct 不写 loader"的来源 |
+| `_in_own_storage(whole_storage=True)` | 新张量塞得进旧 storage 就原位写 | 不改 |
+| padding 清零 | `padding_fill_params` 冷启动登记、begin 整项清零 | 不改（机制后续被 #67563 替换，见 4.6.2） |
+| 启动期拒绝 | `_verify_direct_reload_compat`：LoRA / offload / online quant / torchao / draft lm_head / sharded RDT | 不改 |
 
-> 要特别说清：**"qwen-only"是验证范围与文档口径，不是运行时拦截**。最终 `pr.diff` 里 `worker.py` 只加了 `_check_nz_disabled()`，没有模型/量化/EPLB/fused-MC2 的拒绝检查。未验证的模型在 direct 下**不会被拒**——这正是阶段五要补"拒绝矩阵"的原因（见 4.6.3）。
+读这个 PR 的正确姿势：**先看上游已经提供了什么，再看场景里的哪一类对象让这些前提不成立。**
 
-#### 4.2.2 按调用顺序的六个接入点
+#### 4.2.2 场景：5 种执行模式，归成三档
 
-| 位置 | 需要接入或核对的行为 | 典型错误及判定 | 阶段一覆盖 |
+执行模式由 `enable_fused_mc2` 与是否 eager 决定，而它决定 MoE 权重最终是什么物理形态：
+
+| 执行模式 | `enable_fused_mc2` | 执行方式 | EP | MoE 权重形态 | 档 |
+| --- | --- | --- | --- | --- | --- |
+| `dense-graph` | 0 | 图模式 | 否 | 无 MoE | 档 1 |
+| `eager` | 0 | `--enforce-eager` | 否 | ND | 档 1 |
+| `all2all-mc2` | 0 | 图模式 | 是 | ND | 档 1 |
+| `fused-mc2` | **1** | 图模式 | 是 | **NZ 运行区** | 档 2 |
+| `megamoe` | **2** | 图模式 | 是 | **NZ + expert-list** | 档 3 |
+
+| 档 | 覆盖场景 | 断点数 | 本质 |
 | --- | --- | --- | --- |
-| ① 冷加载与源保留 | 保住 checkpoint 参数对象、名称、必要别名及 loader 属性 | 若源投影在首次 PWAL 后已释放，下一轮 loader 失去写入目标 | MoE 的 `w13/w2` 改为 `retire_parameter`；SFA 的 `kv_b_proj` 属阶段二 |
-| ② begin 恢复加载视图 | 预检归属、共享参数、容量及 offset；参数迁入新 storage 时用当前 offset；NZ 运行权重保留原址，必要时在 ND 张量上接收 | 容量、归属或物理布局不兼容须显式报错；把 opaque NZ 当 ND 字节写会数值错 | ✅ `checkpoint_views` + `_direct_reload_staging` |
-| ③ 分桶写入及 MoE padding | 原模型 loader 负责所有分片；冷启动选中的 padded MoE 参数在 begin 整项清零，随后重发全部有效区 | 桶间不得提前执行模型收尾；核对选中名单、零 padding、有效区 | ✅ 继承上游（机制已被 #67563 替换，见 4.6.2） |
-| ④ finish 与 hook 所有权 | 收齐后先同步，再执行公共 PWAL；已注册 backend 由 children-first 处理，未注册的由 wrapper / impl 委托 | 避免从公共遍历、wrapper、SFA 三条路径重复到达同一 backend | 部分：worker 侧已交付；`IndexerWrapper` 归属修正属阶段二 |
-| ⑤ 图可见权重写回 | 逐个更新内核实际读取的运行权重、持久缓冲、列表元素及派生值；布局兼容时原位回填 | 仅检查 `named_parameters()` 会漏掉融合投影和 expert-list 元素 | ✅ `refill_nz_weight` / `refill_runtime_tensor` / `refill_expert_list` |
-| ⑥ worker 会话与恢复 | 用正确的设备和当前 vLLM 配置调用 finish；异常时上报原错误、结束旧会话、重置更新目标 | 实际注入 PWAL 异常；重试旧 finish 应失败，新事务可修复 | ✅ `set_current_vllm_config` + `_end_weight_update` |
-#### 4.2.3 一次更新的时序
+| 档 1 · ND | `dense-graph` / `eager` / `all2all-mc2` | **0** | 上游契约成立，什么都不用做 |
+| 档 2 · NZ | `fused-mc2` | **2** | MoE 权重被无条件 cast 成 NZ |
+| 档 3 · NZ + 列表 | `megamoe` | **3** | 在档 2 之上，源参数被拆成专家列表 |
+
+**传输不是场景维度。** HCCL / HCCL-packed / IPC（含 packed 变体）只决定字节怎么到 loader 门口，分桶、打包、分块都由 engine 负责，三档代码完全共用；它们之间只有缓冲容量与显存余量的差别（见 4.2.9），没有契约差别。
+
+#### 4.2.3 档 1（`dense-graph` / `eager` / `all2all-mc2`）：零适配
+
+- **为什么成立**：这几种模式下 `enable_fused_mc2=0`，PWAL 不会把 MoE 权重 `npu_format_cast` 成 NZ，权重保持 ND。上游 `begin_direct_reload` 的"在参数自己的 storage 上铺 ND 视图"因此完全成立；`replace_parameter` 的 `_in_own_storage` 也能正常塞回去。
+- **`eager` 的作用**：它不是另一种物理形态，而是**无图对照**——图回放次数必须为 0，用来证明"值和布局对"而不是"图恰好读对了"。
+- **判据**：这几种模式通过，= 一份代码都没为它们写。
+
+#### 4.2.4 档 2（`fused-mc2`）：NZ 带来的两个断点
+
+`enable_fused_mc2=1` 时，MoE 后处理会**无条件**把权重 cast 成 `FRACTAL_NZ`，于是引出两个断点。
+
+**断点 ①：上游要铺 ND 视图，而 storage 里是 NZ**
+
+- 根因：`begin_direct_reload` 对"PWAL 改过布局"的参数执行 `t.data = storage_view(storage, offset, shape, stride, dtype)`——在**原来那块 storage** 上按 checkpoint 布局铺视图。NZ 的 storage 不是 ND 行优先字节，铺 ND 视图写下去就是错的；而 NPU 的 `set_(storage)` 会继承 storage 的 NZ 描述符，所以"借一块 NZ storage 当 ND 用"也不行。
+- 补法：第一次 PWAL 时按 `_ckpt` 记录的布局另开一块 **ND staging**（`parameter._direct_reload_staging`）；Ascend 的 `checkpoint_views` 发现 staging 就返回它当视图，并校验 owner / 布局 / 设备：
+
+```python
+# vllm_ascend/model_loader/weight_reload.py::checkpoint_views
+staging = getattr(t, "_direct_reload_staging", None)
+if staging is not None:
+    if ckpt[0] is not model._ckpt_owner:
+        raise RuntimeError(f"direct reload: {name} staging belongs to another model")
+    if vllm_direct._layout(staging) != ckpt[1] or staging.device != t.device:
+        raise RuntimeError(f"direct reload: {name} has incompatible checkpoint staging")
+    views.append((t, staging))      # loader 写 staging，图读 NZ 运行区
+    continue
+```
+
+- 判据：`begin` 之后该参数的 `data_ptr` 落在 staging 上、大小等于 `_ckpt` 布局；NZ 运行区的 `data_ptr` 不变；图模式用例断言物理格式 29。
+
+**断点 ②：PWAL 每轮新建 NZ 张量，而图读第一轮地址**
+
+- 根因：上游的 `replace_parameter` / `_in_own_storage` 只约束**参数**，对"运行张量"没有约束；而每轮 cast 都会新分配一块 NZ storage 并重绑 `.data`。
+- 补法：保留第一次的 NZ 运行区，之后只 `copy_`。运行区**挂在 `Parameter` 自己身上**（`parameter._direct_reload_runtime`），用上游 `refill_derived` 原位刷新——因为 PWAL 会反复重绑属性名，属性名不可靠；而 `Parameter` 在 begin/finish 期间一直存活，即使它的 `.data` 临时指向 staging。
+
+```python
+def refill_runtime_parameter(layer, name, tensor):
+    parameter = getattr(layer, name)
+    if not direct_reload_enabled():
+        parameter.data = tensor
+        return
+    ckpt = getattr(parameter, "_ckpt", None)
+    if ckpt is not None and not hasattr(parameter, "_direct_reload_staging"):
+        # 这个参数同时是 loader 写入目标：另开一块按 checkpoint 布局的 ND 加载区
+        shape, stride, dtype, offset = ckpt[1]
+        parameter._direct_reload_staging = ...
+    old = getattr(parameter, "_direct_reload_runtime", None)
+    if old is not None:
+        _check_runtime_layout(name, old, tensor)     # layout + 物理 format 变了就报错
+    parameter.data = refill_derived(parameter, "_direct_reload_runtime", tensor)
+```
+
+- 判据：跨轮 `data_ptr` 不变、`Parameter` 对象身份不变；布局或物理 format 变了必须抛错，不允许静默换址。
+
+#### 4.2.5 档 3（`megamoe`）：在档 2 之上再加"专家列表"断点
+
+`enable_fused_mc2=2` 且 `use_cann_megamoe(...)` 为真时，MoE 后处理会把堆叠权重拆成 `w13_weight_list` / `w2_weight_list`，kernel 侧改读列表、由 `_apply_cann_mega_moe` 消费。这带来第三个断点。
+
+**断点 ③：`del` 源参数会被 `begin` 拒绝**
+
+- 根因：老代码拆完列表后 `del layer.w13_weight`；而 `begin` 的 `_check_params_kept` 要求"冷启动记过的每个 checkpoint 名字下，仍然是带 `_ckpt` 的那个对象"，否则抛 `post-load processing replaced the parameter object`。
+- 补法：direct 下改成 `retire_parameter`（对象与数据都留着、只打 `retired` 标记，`kernel_parameters` / `get_live_param` 跳过它），列表本身用 `refill_expert_list` 原地回填：
+
+```python
+for name in ("w13_weight", "w2_weight"):
+    weights = [w.clone() for w in getattr(layer, name).data.unbind(dim=0)]
+    if direct_reload_enabled():
+        refill_expert_list(layer, f"{name}_list", weights)   # 先逐个校验，再逐元素 copy_
+        retire_parameter(layer, name)                        # 对象留着给下一轮 loader
+    else:
+        setattr(layer, f"{name}_list", weights)
+        delattr(layer, name)                                 # layerwise 保持基线
+```
+
+```python
+def refill_expert_list(layer, name, tensors):
+    old = getattr(layer, name, None)
+    if old is None or not direct_reload_enabled():
+        setattr(layer, name, tensors)
+        return
+    if len(old) != len(tensors):
+        raise ValueError(f"{name}: expert runtime layout changed; reload the model and recapture graphs")
+    for index, (target, source) in enumerate(zip(old, tensors)):
+        _check_runtime_layout(f"{name}[{index}]", target, source)   # 先全部校验
+    for target, source in zip(old, tensors):
+        target.copy_(source)                                        # 再逐元素回填
+```
+
+- **验证差异**：档 3 除 token / top-5 / 地址外，还要核对 **expert-list 的地址与布局**，以及真实算子的调用计数——初始推理、重载 B、重载 A 之后，每 rank 的 `_apply_cann_mega_moe` 累计为 **96 / 192 / 288**，每次重载后原图累计回放 28 次、新增捕获 0。
+- 判据：direct 下 `hasattr(layer, "w13_weight")` 为真且带 `retired`；第二次 `begin` 能通过；`kernel_parameters()` 里这份权重只出现一次。
+
+#### 4.2.6 两个与档位正交的修复
+
+**（1）磁盘 reload 入口的配置上下文。** 三种传输都走 transfer engine，入口天然带 `set_current_vllm_config`；但磁盘入口 `NPUWorker.reload_weights` 是直接转发给 runner 的，少了这层上下文，于是 MoE finish 里 `use_cann_megamoe(get_current_vllm_config())` 直接抛错、两个 rank 全挂（与档位无关，任何档走磁盘入口都需要）。
+
+```python
+# 四个入口统一包住；finish 失败时用“模型状态”判断这一轮是不是 direct
+was_direct = direct_reload_active(self.weight_transfer_engine.model)   # finish 会先 pop 掉标记
+try:
+    self.weight_transfer_engine.finish_weight_update()
+except BaseException:
+    if was_direct:
+        self._end_weight_update()      # 清 active + reset 更新目标
+    raise
+self._end_weight_update()
+```
+
+**（2）视图规划器只能运行期替换。** 上游 `begin_direct_reload` 里写的是模块全局名 `_checkpoint_views(model)`，没有 backend provider hook，所以只能在 import 期替换：
+
+```python
+# vllm_ascend/patch/worker/__init__.py
+if direct_reload_enabled():
+    from vllm_ascend.model_loader.weight_reload import install_direct_reload_patch
+    install_direct_reload_patch()
+```
+
+`checkpoint_views` 的第一句是"整个模型没有任何 staging → 直接委派上游"，所以**档 1 的模型完全走上游路径**，零改动、零风险。这条替换依赖三个上游私有名（`_checkpoint_views`、`_layout`、`loadable_tensors`），pin 升级时要逐个核对：前两个在 import 期就会摸到（改名立刻 `AttributeError`），`_layout` 在函数体内调用（改名要到第一次 reload 才炸）。
+
+#### 4.2.7 补完之后，一次更新长这样
 
 ```mermaid
 sequenceDiagram
@@ -546,7 +644,7 @@ sequenceDiagram
   C->>W: start_weight_update
   W->>W: 拒绝 weight_nz_mode 开启的配置
   W->>W: begin：参数改指 checkpoint 视图
-  Note over W: 含 staging 的张量改指 ND 加载区
+  Note over W: 档 2/3：有 staging 的参数改指 ND 加载区
   loop 每个 bucket
     L->>L: 写入 checkpoint 字节 有效区
   end
@@ -554,295 +652,58 @@ sequenceDiagram
   W->>W: 设备同步 清一次性 guard
   W->>P: 重跑后处理
   P->>P: 转置 打包 融合
-  P->>P: 强制 NZ 走 临时 cast 再原地回填
+  P->>P: 档 2/3：强制 NZ 走临时 cast 再原地回填
   P->>R: 派生值原位刷新
-  R->>R: expert list / 运行张量 / buffer / host scalar 校验
+  R->>R: 档 3：expert list 逐元素校验；运行区 copy
   P->>G: 运行张量地址保持
   C->>G: replay
   G-->>C: 读到 B
 ```
 
-这张图与 2.3 的主图差别只有三处，正好是 Ascend 在阶段一的三个改造点：**begin 里多一层 Ascend 视图规划器**、**PWAL 里强制 NZ 要"临时 cast + 原地回填"**、**派生值要经过 Ascend 的 refill 工具**。
+这张图与 2.3 的主图差别只有三处，正好对应档 2/3 的三个断点：**begin 多一层视图规划**、**PWAL 里强制 NZ 用"临时 cast + 原地回填"**、**派生值与专家列表要经过 Ascend 的 refill 工具**。档 1 与 2.3 的主图完全一致。
 
-#### 4.2.4 拿到运行时对象，先问它是什么
+#### 4.2.8 交付物与规模
 
-阶段一的实现可以归成一张判定图：**先确定对象类型，再决定处置方式**。
+相对 Ascend `31bb5f5f0`：**13 个文件 / +605 −78**（5 个生产 + 7 个测试 + 1 个 release note）。
 
-```mermaid
-flowchart TD
-  A["拿到一个运行时对象"] --> B{"是 checkpoint 参数吗"}
-  B -->|"是"| C{"后处理还要用它计算吗"}
-  C -->|"要 布局不变"| C1["保留对象 只更新 data"]
-  C -->|"要 布局变"| C2["replace_parameter 尽量写回旧 storage"]
-  C -->|"不再直接参与计算"| C3["retire_parameter 保留加载入口"]
-  C -->|"只是换了名字"| C4["move_parameter 两名同一对象"]
-  B -->|"否 派生对象"| D{"kernel 会读这块地址吗"}
-  D -->|"是 普通属性"| D1["refill_derived 原位 copy"]
-  D -->|"是 非持久 buffer"| D2["refill_derived_buffer 布局变即报错"]
-  D -->|"是 专家列表"| D3["refill_expert_list 先校验再逐元素 copy"]
-  D -->|"是 物理 format 变"| D4["ND 加载区 + NZ 运行区 原地回填"]
-  D -->|"否 host scalar"| D5["值变则拒绝 要求重建重捕获"]
-  C1 --> E["下轮 begin 仍能找到写入目标"]
-  C2 --> E
-  C3 --> E
-  C4 --> E
-  D1 --> F["图读的地址不变"]
-  D2 --> F
-  D3 --> F
-  D4 --> F
-```
-
-读图要点：
-
-- **左半支是"参数身份"**：能不能下轮再写、写进去是不是原位，取决于这里选哪种处置。
-- **右半支是"派生对象"**：它们不是 checkpoint 数据，begin 不会给它们建视图，所以只能靠后处理**主动原位刷新**；布局一变就必须报错，因为图引用的就是这块地址。
-- **host scalar 是唯一"只能拒绝"的**：它被烘焙进算子入参，改值不会让已捕获的图重新读它（阶段一不命中 FlatQuant 这类路径，条目保留）。
-
-#### 4.2.5 关键实现
-
-**(1) 参数身份与专家列表（①）**
-
-```python
-# 原：新建列表 + 删除源参数（下一轮无法再加载，图也丢引用）
-layer.w13_weight_list = [w.clone() for w in layer.w13_weight.data.unbind(dim=0)]
-del layer.w13_weight
-
-# 新：列表原地回填；direct 下源参数退休，layerwise 保持基线的删除
-for name in ("w13_weight", "w2_weight"):
-    weights = list(getattr(layer, name).data.unbind(dim=0))
-    refill_expert_list(layer, f"{name}_list", [w.clone() for w in weights])
-    if direct_reload_enabled():
-        retire_parameter(layer, name)
-    else:
-        delattr(layer, name)
-```
-
-三个 refill 工具的区别必须分清：
-
-| 工具 | 归属 | 布局变化时的处理 | 适用对象 |
-| --- | --- | --- | --- |
-| `refill_derived` | vLLM 通用 | 允许 `setattr` 换对象（调用方保证图契约） | 普通派生属性 |
-| `refill_expert_list` | Ascend | **报错**（元素被图引用，换地址就是错） | 专家列表及其元素 |
-| `refill_derived_buffer` | Ascend（阶段二才接回） | direct 下**报错** | 非持久 buffer（KPool 等） |
-
-```python
-def refill_expert_list(layer, name, tensors):
-    old = getattr(layer, name, None)
-    if old is None or not direct_reload_enabled():
-        setattr(layer, name, tensors)   # layerwise 保持基线行为
-        return
-    if len(old) != len(tensors) or any(_layout(a) != _layout(b) for a, b in zip(old, tensors)):
-        raise ValueError(f"{name}: expert runtime layout changed; reload the model and recapture graphs")
-    for target, source in zip(old, tensors):
-        target.copy_(source)            # 先全量校验，再逐元素回填
-```
-
-**(2) 派生量必须拥有独立 storage（⑤）**
-
-派生量一旦是 Parameter，就会进 `loadable_tensors`，begin 会给它建 checkpoint 视图——但它根本不是 checkpoint 数据，loader 会往"派生量的视图"里写字节，两边互相踩。所以派生量必须是**拥有独立 storage 的普通属性或非持久 buffer**。
-
-阶段一里这条原则的落地就是下面 (3) 的两块区：MoE 的 NZ 运行区与 expert-list 的每个元素都拥有自己的分配，并被 `_reload_runtime_buffers` 记住。**GLM KPool 的 5 个派生 buffer**（用切片 / `float()` / `contiguous()` 派生，可能直接别名到 checkpoint 参数）连同 `refill_derived_buffer` 一起**随注意力线移出了收缩版**，接回工作属于阶段二（见 4.3.2）。
-
-**(3) 强制 NZ：ND 加载区 + NZ 运行区（②⑤）**
-
-这是 Ascend 最特殊的一块。背景是三个事实叠在一起：
-
-- RL 场景要求 `weight_nz_mode=0`（走 ND），但 Ascend 的**部分内核只接受 FRACTAL_NZ**，会在后处理里**无条件** `npu_format_cast`；
-- 每次 cast 都新建一块 NZ storage 再 `attr.data = tensor` → **地址每轮都变**，图读旧地址；
-- 而这个参数同时是 loader 的写入目标（checkpoint 参数），begin 时必须有一块**按 checkpoint 布局的 ND 区**可写。
-
-两个需求冲突，所以方案是**两块区并存**：ND 区只给 loader 写，NZ 区只给图读，后处理负责把 ND 转成 NZ 并回填。
-
-```python
-def refill_nz_weight(layer, name, *, force: bool = True):
-    source = getattr(layer, name).data
-    if not force and not _should_trans_nz(source):
-        return                                                           # 策略不允许：保持 ND
-    if direct_reload_enabled():
-        # 用 set_/as_strided 重建的张量可能继承 storage 的原描述，
-        # 先 clone 成连续 ND，让 cast 按最终运行 shape 进行
-        source = source.clone(memory_format=torch.contiguous_format)
-    tensor = torch_npu.npu_format_cast(source, ACL_FORMAT_FRACTAL_NZ)   # 临时 NZ
-    refill_runtime_parameter(layer, name, tensor)                        # 回填固定运行区
-
-def refill_runtime_parameter(layer, name, tensor):
-    if not direct_reload_enabled():
-        getattr(layer, name).data = tensor
-        return
-    parameter = getattr(layer, name)
-    ckpt = getattr(parameter, "_ckpt", None)
-    if ckpt is not None and not hasattr(parameter, "_direct_reload_staging"):
-        # 这个参数同时是 loader 写入目标：另开一块 ND 加载区
-        shape, stride, dtype, offset = ckpt[1]
-        parameter._direct_reload_staging = torch.empty_strided(
-            shape, stride, dtype=dtype, device=parameter.device)
-    buffers = layer.__dict__.setdefault("_reload_runtime_buffers", {})
-    old = buffers.get(name)
-    if old is None:
-        buffers[name] = tensor
-    else:
-        if _layout(old) != _layout(tensor):
-            raise ValueError(f"{name}: runtime layout changed; rebuild and recapture graphs")
-        if old.device.type == "npu" and torch_npu.get_npu_format(old) != torch_npu.get_npu_format(tensor):
-            raise ValueError(f"{name}: physical format changed; rebuild and recapture graphs")
-        old.copy_(tensor)      # NZ → NZ 原地回填，地址不变
-        tensor = old
-    getattr(layer, name).data = tensor
-```
-
-四个"看起来能省、实际不可行"的做法（都在真机上验证过）：
-
-| 想省掉的做法 | 不可行的原因 |
-| --- | --- |
-| 直接在 NZ storage 上建 ND 视图给 loader 写 | NPU 的 `set_(storage)` 视图会**继承 storage 的 NZ 描述**，专家切片 loader 无法把它当 ND 用 |
-| 用 `npu_format_cast` 的返回值判断"是否已是 NZ" | 这套 CANN 上某些视图会"原地址返回 ND"，格式查询不可靠，只能以 `data_ptr` 为准 |
-| 每轮新建 NZ 张量再赋值 | 地址每轮漂移，图读到旧值，且不报错 |
-| NZ → NZ 也先 clone 再赋值 | 多余一次全量拷贝；`copy_` 在同布局 NZ→NZ 下既保址又保值 |
-
-代价要说清：**强制 NZ 的权重 2× 常驻**（NZ 运行区 + ND 加载区），每轮还有一次 clone 的瞬时峰值。方案接受这个代价，因为替代方案（每轮换地址）是正确性问题。
-
-交付版把"运行区保址"抽成了 `refill_runtime_tensor`（同一套 layout / 物理 format 校验），好让非 Module 的 attention impl 也能复用；`refill_runtime_parameter` 只多做一件事：给"同时是 loader 目标"的参数另开 ND staging（含非零 offset 的分配）。
-
-**(4) Ascend 实现的接入方式（②的落点）**
-
-vLLM 侧不允许改非 PR 内容，所以用**运行期替换**：
-
-```python
-# vllm_ascend/patch/worker/__init__.py
-if getattr(vllm_envs, "VLLM_RELOAD_MODE", None) == "direct":
-    import vllm_ascend.patch.worker.patch_direct_reload  # noqa: F401
-```
-
-```python
-# vllm_ascend/model_loader/weight_reload.py
-_UPSTREAM_CHECKPOINT_VIEWS = vllm_direct._checkpoint_views   # 只捕获一次，避免套娃
-
-def checkpoint_views(model):
-    # 没有任何 staging（普通 ND 模型）→ 直接走原 PR 实现，零改动
-    if not any(getattr(t, "_direct_reload_staging", None) is not None
-               for _, t in vllm_direct.loadable_tensors(model)):
-        return _UPSTREAM_CHECKPOINT_VIEWS(model)
-    ...  # 有 staging：校验 owner / 布局 / device，然后返回 (t, staging)
-
-def install_direct_reload_patch():
-    vllm_direct._checkpoint_views = checkpoint_views
-```
-
-两个好处：**零侵入**（vLLM 文件一个字节不改，可逐文件哈希证明）与**渐进**（不用 staging 的模型完全走上游路径）。patch 必须登记目标、原因、关联 PR、移除计划与作用范围，否则下次升级没人知道它为什么存在。
-
-**(5) finish 与 hook 所有权（④）**
-
-一轮收尾要做到"统一、有序、不重复"，并且"没有 forward 里临时补建"的路径。调度顺序：
-
-```mermaid
-flowchart TD
-  A["finish 中的统一收尾"] --> B["逐个量化层 先跑 quant method 后处理"]
-  B --> C["deferred attention 层"]
-  C --> D["children-first 遍历其余 module"]
-  D --> E{"这个 module 要跳过吗"}
-  E -->|"是 quant method 实例"| E1["跳过 上一步已处理"]
-  E -->|"是量化层子模块"| E2["跳过 归 quant method"]
-  E -->|"是 deferred attention"| E3["跳过 attention pass 已处理"]
-  E -->|"否"| F{"有 process_weights_after_loading 吗"}
-  F -->|"没有"| F1["跳过"]
-  F -->|"有"| S{"签名是无参吗"}
-  S -->|"否 Ascend 旧签名"| S1["改成无参 构造期存 act_dtype"]
-  S -->|"是"| H["调用一次 子先于父"]
-  H --> I{"wrapper 还会转发给子模块吗"}
-  I -->|"会"| I1["双调 必须删除转发"]
-  I -->|"不会"| J["顺序与次数正确"]
-  S1 --> H
-```
-
-**Ascend 侧的两个坑都在这一格**：
-
-```mermaid
-sequenceDiagram
-  autonumber
-  participant FW as finalize_model_weights
-  participant CH as 子模块 backend
-  participant WR as Ascend wrapper（IndexerWrapper / SFA）
-  participant Q as quant method
-
-  FW->>CH: 遍历到子模块 跑一次 hook
-  FW->>WR: 遍历到 wrapper
-  alt wrapper 已删除转发
-    WR-->>FW: 自己不做任何事
-    Note over CH: 一轮只处理一次 顺序正确
-  else wrapper 仍保留转发
-    WR->>CH: 又转发一次
-    Note over CH: 第二次后处理时权重已是运行布局
-    CH-->>Q: 再转换一次
-    Q-->>FW: 数值错 或 直接崩溃
-  end
-```
-
-交付版的做法不是"删掉所有转发"，而是**按对象所有权判断**：`impl` / `indexer` 已经注册进模块树（`isinstance(..., nn.Module)`）时，交给 children-first 遍历；未注册的普通对象仍由 wrapper / SFA 显式委托。
-
-> 阶段一（收缩版）只带有 worker 侧的 `set_current_vllm_config` 与统一会话收尾，**不含**下面这两处归属修正——它们改的 `ops/mla.py` 与 `attention/sfa_v1.py` 已随注意力线移出，接回工作属于阶段二（4.3.2）。
-
-| 路径 | 改前 | 改后 | 改法 |
-| --- | --- | --- | --- |
-| KPool 形态的完整链路 | 公共遍历 1 次 + `IndexerWrapper` 转发 1 次 + SFA→wrapper→backend 1 次 = **3** | **1** | `ops/mla.py`：`impl` 是已注册 `nn.Module` 时不再转发 |
-| SFA 的 indexer | 公共遍历 1 次 + SFA 显式 1 次 = **2** | **1** | `attention/sfa_v1.py`：已注册 Module 的 indexer 跳过重复委托 |
-| 普通（非 Module）backend / indexer | 1 | 1（不变） | 保留显式委托；`vllm_version_is("0.33.0")` 分支也保留 |
-
-判据是**对象所有权**，不是"已处理"布尔标志：每轮 finish 都重新判、重新执行，不会出现"第二轮被跳过"。**没有新增跨轮 guard**。
-
-**(6) worker 会话与失败恢复（⑥）**
-
-direct 的 finish 在开头就消费掉 begin，所以**失败后不能重试同一个 finish**：
-
-```python
-# finish 失败：direct 已消费 begin，只能开新一轮完整更新
-try:
-    self.weight_transfer_engine.finish_weight_update()
-except BaseException:
-    if direct_reload_enabled():
-        self._end_weight_update()      # 清 active + reset 更新目标
-    raise
-self._end_weight_update()
-```
-
-**没有回滚**是设计选择：direct reload 不保存快照，修复靠"下一次完整更新"。所以"失败后能重新 start"是硬需求。
-
-**(7) MoE padding 的选中与清零（③）**
-
-上游的 selector 挂在 `RoutedExperts` 上：只有"维度对不上"（hidden / intermediate 大于 unpadded 版本，或 TP shard 带 padding）时才需要清；**per-expert 标量（`(E,)`、`(E, ≤2)`）不是 padding 的对象**，混进去会把真实数据清零。清零会擦掉 checkpoint 区域，所以清零之后调用方**必须完整重发这些参数的有效区**——"begin 清零"与"必须全量发送"是绑定的。
-
-Ascend 侧的核对点：padding 可能发生在 **scheme 的后处理里**（`_maybe_pad_weight`、`F.pad`、TP padding），`moe_config` 上不一定有 unpadded 字段。阶段一要先确认实际命中的 BF16 路径是否产生 padding：
-
-- 有 padding → 需要该 scheme 实现等价的 `padding_fill_params()`（或登记"N/A 及理由"），并把结果并进 begin 的清零清单；
-- 强制 NZ 参数的 padding 在 NZ 布局下，清零要在 **staging** 上做，否则会清到运行区；
-- 无 padding（例如本阶段实测的配置）→ 该行登记为"N/A + 依据"，而不是留空。
-
-#### 4.2.6 A3 与 A5 分别验什么
-
-| 分支 | 观察对象与建议用例 | 通过条件 |
+| 文件 | +/− | 对应断点 |
 | --- | --- | --- |
-| 普通 BF16 dense（如 Qwen3-0.6B） | 普通 Linear 及实际命中的转置 / 融合权重；磁盘与 HCCL 两个入口各跑一遍 | 两入口各自取得冷 B 对照，原图跨轮推理，随后可装回 A |
-| BF16 MoE（如 Qwen3-30B-A3B） | 堆叠权重或 expert-list 路径，记录 w13/w2、列表元素与强制 NZ；目标配置出现 padding 时加入 ③ 的检查 | 有效专家权重与计算结果匹配冷 B；原图所持每个元素继续有效；按硬件、布局及 TP/EP 规模分别登记 |
-| 图模式 | eager 与 `FULL_DECODE_ONLY` 各跑一轮 | 图实例不变、capture 数不增、replay 数增长（0 recapture） |
-| 失败恢复 | 在真实 worker 入口注入一次 PWAL 异常 | 旧会话结束、新 start 可开、完整重发后原图匹配冷 B |
+| `model_loader/weight_reload.py`（新增） | +143 | 断点 ①②③ 的工具与 `checkpoint_views` 规划器 |
+| `ops/fused_moe/routed_experts.py` | +16/−12 | 档 2/3 的 MoE 侧落点 |
+| `worker/worker.py` | +30/−11 | 磁盘入口的配置上下文与会话收尾（4.2.6） |
+| `patch/worker/__init__.py` / `patch/__init__.py` | +7 / +8 | 视图规划器的安装与台账（4.2.6） |
 
-SFA / KPool、A5 native MLAPO、PROLOG_V3 等分支**不在阶段一**（收缩版已把注意力线删除），它们的验证清单见 4.3.2。
+#### 4.2.9 验证覆盖与已知边界
 
-#### 4.2.7 阶段一的交付边界
+30B（48 层、TP2）在 188 昇腾 A3 上的完整矩阵：**三档 × 三种传输（含 packed 变体）共 16 项在线用例，15 项通过、1 项显存不足、0 项跳过；另有磁盘重载对照 1 项通过。**
 
-阶段一用**权重常驻内存**的完整事务建立最小可用能力。三条边界必须写清：
+| 档 | 覆盖 | 结果 |
+| --- | --- | --- |
+| 档 1 | `dense-graph` / `eager` / `all2all-mc2` × 4 种传输 | 全部通过；A→B 约 37–195 s |
+| 档 2 | `fused-mc2` × 4 种传输 | 3 通过；packed IPC 在 1024 MiB 缓冲下显存不足 |
+| 档 3 | `megamoe` × 4 种传输 | 全部通过；A→B 约 69–210 s |
+| 磁盘 | 与 layerwise 对照（普通图模式） | 通过；重载中位 48.05 s vs layerwise 75.61 s |
 
-1. **MoE padding 在无 sleep 时也可能触发**；HCCL 在普通更新结束时也会归还可释放缓存。这两项随首批路径验收：HCCL 继承的 finish 先调 `finish_reload`、再调 `empty_cache()`，direct 收尾在 PWAL 前执行的设备同步负责让其他流的写入可见——**分别核对两者的位置，无需在 Ascend 再叠加一次全局 finish**。
-2. **只承诺"同一份入口的全量更新"**：数据回滚、自动拦截所有推理入口、完整的整轮完整性检查（#65799）都不在本阶段；调用方在成功 finish 前必须保持模型暂停。
+**验收口径**：每种模式独立冷加载 A、B 作为参考；通过用例逐轮核对 token ID、top-5 logprobs（绝对误差 ≤ 1e-4）、权重地址与布局；图模式核对原图回放与零重捕，eager 核对零回放；最后一条 HTTP 请求必须返回预期文本。
+
+**唯一失败项：packed IPC + `fused-mc2`。** 1024 MiB 缓冲下，trainer 上传输入权重时再申请 594 MiB 失败；换成 594 MiB 缓冲复测，A→B 耗时 22.51 s、B→A 31.68 s，两轮各收 99 个 packed 分块，全部断言通过。原因是这个组合同时存在 **packed 缓冲 + NZ 运行区 + ND staging** 三份占用，显存余量敏感（重载前空闲 1.85～2.02 GiB）。结论是**该组合能跑通，但要按"缓冲容量 + 显存余量"配置**，不写成"不支持"。
+
+**反例要求**：撤掉档 2/3 的任一修复，必须能看到具体失败——断点 ① 撤掉是"数值错但不报错"，断点 ② 撤掉是 `data_ptr` 断言红，断点 ③ 撤掉是 `begin` 直接抛错。没有反例的"通过"不算验收。
+
+#### 4.2.10 未覆盖的场景与阶段边界
+
+| 未覆盖 | 为什么不在本阶段 | 归属 |
+| --- | --- | --- |
+| MLA / SFA / MLAPO / KPool / `wo_a` 这些 attention 线 | 收缩版整条删除，需要按模型族逐条接回 | 阶段二（4.3.2） |
+| padding 机制换版（#67563） | 要先确认目标 pin 的实际实现 | 阶段五（4.6.2） |
+| 量化（除 A5 MXFP） | 本次不做 | — |
+| 更大并行规模（TP4/TP8、PD/CP） | 未验证 | 阶段二按入口登记 |
+
+三条交付边界：
+
+1. **MoE padding 在无 sleep 时也可能触发**；HCCL 在普通更新结束时也会归还可释放缓存。HCCL 继承的 finish 先调 `finish_reload`、再调 `empty_cache()`；direct 收尾在 PWAL 前的设备同步负责让其他流写入可见——**分别核对位置，无需在 Ascend 再叠加一次全局 finish**。
+2. **只承诺"同一份入口的全量更新"**：数据回滚、自动拦截所有推理入口、整轮完整性检查（#65799）都不在本阶段；调用方在成功 finish 前必须保持模型暂停。
 3. **不承诺跨模式等价**：layerwise 与 direct 的数值等价未建立；layerwise 的 expert-list 旧图读 A 是已知边界。
-
-| 路径 | 阶段一结论 | 处理规则 |
-| --- | --- | --- |
-| 量化（W4A4 / W4A8 / W8A8 / WNA16、量化 KV） | 不在本阶段 | 阶段四（A5 MXFP）；其他量化不做 |
-| MTP / 推测解码 / draft 更新 | 不在本阶段 | 阶段五，且需业务明确"只更新 target / 只更新 draft / 两者一起" |
-| MegaMoe 共享专家融合 | 需 `enable_fused_mc2 == 3` + MXFP，当前目标硬件不可达 | 记录为"目标配置不可达"，不作为已支持 |
-| 310P | 有独立 PWAL 与硬件差异 | 排除，并写清文件与范围依据 |
-| 真实 HCCL / 多卡规模 | 传输路径与并行扩展 | 需要独立证据，磁盘 bucket 不能替代；按阶段二登记 |
-| 强制 NZ 的内存 | 2× 常驻 + 每次 clone 峰值 | 按 EP 切分给出估算，必要时"finish 后释放加载区" |
 
 ### 4.3 阶段二：通道 × 打包 × 模型矩阵（可与阶段三、四并行）
 
@@ -856,7 +717,7 @@ SFA / KPool、A5 native MLAPO、PROLOG_V3 等分支**不在阶段一**（收缩�
 | 入口 | 打包 | 现状 | 阶段二要补什么 |
 | --- | --- | --- | --- |
 | 磁盘 / inplace checkpoint | — | 已过（0.6B / 30B，eager / graph） | 更大模型、TP/EP 组合；注意 dummy start 的引擎上磁盘入口在两种模式下都会失败 |
-| HCCL | unpacked | 已过（仓内 e2e 629 s） | 多卡 / TP / EP / PD 配置按业务补 |
+| HCCL | unpacked | 已过（Qwen3.5-35B-A3B 四层 A→B→A 两次精确匹配冷参考；190 A3 上 0.6B/30B 另测） | 多卡 / TP / EP / PD 配置按业务补 |
 | HCCL | **packed** | **skip**（依赖 #18726 / #18763） | 按 #68043 的新 `chunk_layout` 重做收发；bucket 边界与缓冲复用要重新验 |
 | NPU IPC | unpacked | 未验证 | 设备映射、句柄生命周期、finish 同步 |
 | NPU IPC | **packed** | 未验证 | 与 #68043 共用一套布局，和上行合并实施 |
@@ -873,11 +734,11 @@ SFA / KPool、A5 native MLAPO、PROLOG_V3 等分支**不在阶段一**（收缩�
 | 模型族 | 需要接的线 | 依据 / 备注 |
 | --- | --- | --- |
 | Qwen3 / Qwen3-MoE | 已覆盖：dense（ND）、MoE（ND / fused-MC2 NZ / expert-list） | 阶段一 |
-| DeepSeek-V4 | MLA：MLAPO 的三个 NZ 投影（`weight_dq` / `weight_dkv_kr` / `weight_uq_qr`）+ padded `mlapo_W_UK_T`；SFA 的 PROLOG_V3 三分支；`wo_a` 的三维 reshape | 收缩版把这几条线整条删掉；`wo_a` 用 `replace_parameter` 保址，MLAPO/SFA 用 `refill_runtime_tensor` |
+| DeepSeek-V4 | MLA：MLAPO 的三个 NZ 投影（`weight_dq` / `weight_dkv_kr` / `weight_uq_qr`）+ padded `mlapo_W_UK_T`；SFA 的 PROLOG_V3 三分支；`wo_a` 的三维 reshape | 收缩版把这几条线整条删掉；`wo_a` 用 `replace_parameter` 保址，MLAPO/SFA 的融合投影按 `refill_runtime_parameter` 的同一思路（挂在参数上，用 `refill_derived` 原位刷新） |
 | GLM-5.3 | KPool / indexer 的 5 个派生 buffer（`_key_weight`、`_gate_weight`、`_head_weight_f32`、`_norm_weight_f32`、`_norm_bias_f32`）；indexer 零宽 RoPE；KDA 的 Q/K/V 融合 `conv1d.weight` | vllm-ascend #19828 已给出缓存方案；派生 buffer 用 `refill_derived_buffer` |
 | Kimi-K3 / MiniMax-M3 / gpt-oss | 按业务触发逐个界定（KDA conv、MegaMoE、MXFP4 专家切分） | 各自有 TP / 量化前置，不预先承诺 |
 
-接回来时要守同一条判定：**图读的地址不变**。所以每条线的落点都是"有 `Parameter` 就用 `refill_runtime_parameter` / `replace_parameter`，没有就用 `refill_runtime_tensor` / `refill_derived_buffer`"，不允许"每轮新建 + 重绑属性"。
+接回来时要守同一条判定：**图读的地址不变**。所以每条线的落点都是"有 `Parameter` 就用 `refill_runtime_parameter` / `replace_parameter`，只有普通属性或非持久 buffer 才用 `refill_derived` / `refill_derived_buffer`"，不允许"每轮新建 + 重绑属性"。
 
 #### 4.3.3 验收
 
@@ -1029,7 +890,7 @@ for target, source in zip(old, tensors):
 
 #### 4.6.1 为什么需要这一阶段
 
-阶段一固定在 vLLM `c410543d9` / vllm-ascend `4d90fc908`。而上游在 11-09 之后又合入 15 个 RFC PR（3.2），其中 **5 处落在 Ascend 实际改过的路径上**：padding 清零机制、finish 的遍历集合、finish 完整性检查、packed 线格式、默认模式开关。这些不是"新功能"，而是**既有契约被改写**——不改不会报错，会静默错。
+阶段一固定在 vLLM `c410543d9` / Ascend 分支 `feat/rfc54477-qwen-only`（基于 `31bb5f5f0`）。而上游在 11-09 之后又合入 15 个 RFC PR（3.2），其中 **5 处落在 Ascend 实际改过的路径上**：padding 清零机制、finish 的遍历集合、finish 完整性检查、packed 线格式、默认模式开关。这些不是"新功能"，而是**既有契约被改写**——不改不会报错，会静默错。
 
 这 5 处是否已经包含在 `c410543d9` 里，要按 pin 的实际内容逐项核对；下表的"旧实现"列以**阶段一当前代码**为准，核对方式是对照该 pin 里 `reload/direct.py`、`weight_utils.py`、`reload/packed*.py` 的实际实现。
 
